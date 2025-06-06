@@ -315,32 +315,22 @@ def get_everything_from_spotify_producer_page(producer_url, batch_size=9, test=T
         ctx = multiprocessing.get_context('spawn')
         with ctx.Pool(processes=num_processes) as pool:
             process_manager.register_pool(pool)
-            try:
-                for i in range(0, len(song_dict), batch_size):
-                    batch_idx = i // batch_size + 1
-                    
-                    try:
-                        batch_results = pool.starmap(get_genius_song_credits_from_api, 
-                            [(None, None, song_dict[i].get("song_name"), 
-                              song_dict[i].get("artist_name"), song_dict[i].get("track_id"), genius_token) 
-                             for i in range(i, min(i + batch_size, len(song_dict)))])
-                        results.extend([r for r in batch_results if r.get("song_name") is not None])
-                        
-                    except Exception as e:
-                        print(f"Error in batch processing: {str(e)}")
-                        continue
-                    
-                    current_progress = 20 + (batch_idx * 30.0 / len(song_dict))
-                    update_progress(current_progress, f"Obtained detailed information for {min(i + batch_size, len(song_dict))} songs")
-                    
-                    if i + batch_size < len(song_dict):
-                        time.sleep(0.5)
-            
-            except Exception as e:
-                print(f"Error in pool processing: {str(e)}")
-            
+            for i in range(0, len(song_dict), batch_size):
+                batch_idx = i // batch_size + 1
+                try:
+                    batch_results = pool.starmap(get_genius_song_credits_from_api, 
+                        [(None, None, song_dict[j].get("song_name"), 
+                          song_dict[j].get("artist_name"), song_dict[j].get("track_id"), genius_token) 
+                         for j in range(i, min(i + batch_size, len(song_dict)))])
+                    results.extend([r for r in batch_results if r.get("song_name") is not None])
+                except Exception as e:
+                    print(f"Error in batch processing: {str(e)}")
+                    continue
+                current_progress = 20 + (batch_idx * 30.0 / len(song_dict))
+                update_progress(current_progress, f"Obtained detailed information for {min(i + batch_size, len(song_dict))} songs")
+                if i + batch_size < len(song_dict):
+                    time.sleep(0.5)
     finally:
-        # Just use gc.collect() instead of _clean()
         gc.collect()
     
     return results
