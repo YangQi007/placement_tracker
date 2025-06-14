@@ -24,6 +24,9 @@ wheels/
 venv/
 ENV/
 env/
+credentials.json
+myvenv/
+token.pickle
 
 # IDE
 .idea/

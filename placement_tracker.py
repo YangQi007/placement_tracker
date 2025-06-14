@@ -24,7 +24,193 @@ import signal
 import sys
 import platform
 import subprocess
-import tomli  # Add this to imports
+import tomli
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+import pickle
+import datetime
+
+# CRITICAL: Multiprocessing protection - must be at module level
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
+
+# For packaged apps, set spawn method immediately but only if we're the main module
+if __name__ == '__main__' and getattr(sys, 'frozen', False):
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+
+# Global flag to prevent multiprocessing during import
+_ALLOW_MULTIPROCESSING = False
+_IS_MAIN_PROCESS = __name__ == '__main__'
+
+# Google Sheets API setup
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+def get_google_sheets_credentials():
+    """Get or refresh Google Sheets API credentials"""
+    creds = None
+    
+    # Use the same path resolution logic as load_credentials
+    def get_possible_paths(filename):
+        possible_paths = []
+        
+        if getattr(sys, 'frozen', False):
+            if platform.system() == "Darwin":  # macOS
+                # 1. Next to the .app bundle
+                app_path = os.path.dirname(sys.executable)
+                bundle_path = os.path.abspath(os.path.join(app_path, '..', '..', '..'))
+                possible_paths.append(os.path.join(bundle_path, filename))
+                
+                # 2. Inside the .app bundle's Resources
+                resources_path = os.path.abspath(os.path.join(app_path, '..', 'Resources'))
+                possible_paths.append(os.path.join(resources_path, filename))
+                
+                # 3. Inside the .app bundle's MacOS directory
+                possible_paths.append(os.path.join(app_path, filename))
+            else:
+                # For Windows/Linux frozen executables
+                exe_path = os.path.dirname(sys.executable)
+                possible_paths.append(os.path.join(exe_path, filename))
+        else:
+            # If running from Python interpreter
+            script_path = os.path.dirname(os.path.abspath(__file__))
+            possible_paths.append(os.path.join(script_path, filename))
+        
+        return possible_paths
+    
+    # Find token.pickle
+    token_path = None
+    for path in get_possible_paths('token.pickle'):
+        if os.path.exists(path):
+            token_path = path
+            break
+    
+    # If no existing token found, use the first possible path for saving
+    if not token_path:
+        token_path = get_possible_paths('token.pickle')[0]
+    
+    # Check if we have stored credentials
+    if os.path.exists(token_path):
+        try:
+            with open(token_path, 'rb') as token:
+                creds = pickle.load(token)
+        except Exception as e:
+            print(f"Error loading token.pickle: {str(e)}")
+            creds = None
+    
+    # If credentials don't exist or are invalid, get new ones
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"Error refreshing credentials: {str(e)}")
+                creds = None
+        
+        if not creds:
+            # Find credentials.json
+            credentials_path = None
+            for path in get_possible_paths('credentials.json'):
+                print(f"Checking for credentials.json at: {path}")
+                if os.path.exists(path):
+                    credentials_path = path
+                    print(f"Found credentials.json at: {path}")
+                    break
+            
+            if not credentials_path:
+                print("No credentials.json found in any of these locations:")
+                for path in get_possible_paths('credentials.json'):
+                    print(f"- {path}")
+                messagebox.showerror("Google Sheets Setup", 
+                    "Please place your Google Sheets API credentials.json file in the application directory.\n"
+                    "You can get this from the Google Cloud Console.\n\n"
+                    f"Expected locations:\n" + "\n".join([f"• {path}" for path in get_possible_paths('credentials.json')]))
+                return None
+            
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
+                creds = flow.run_local_server(port=0)
+            except Exception as e:
+                print(f"Error creating OAuth flow: {str(e)}")
+                messagebox.showerror("Google Sheets Setup", 
+                    f"Error setting up Google Sheets authentication: {str(e)}")
+                return None
+        
+        # Save the credentials for future use
+        if creds:
+            try:
+                # Ensure the directory exists
+                os.makedirs(os.path.dirname(token_path), exist_ok=True)
+                with open(token_path, 'wb') as token:
+                    pickle.dump(creds, token)
+                print(f"Saved credentials to: {token_path}")
+            except Exception as e:
+                print(f"Error saving token.pickle: {str(e)}")
+    
+    return creds
+
+def create_or_update_sheet(spreadsheet_id, sheet_name, data):
+    """Create or update a Google Sheet with the provided data"""
+    try:
+        creds = get_google_sheets_credentials()
+        if not creds:
+            return None
+            
+        service = build('sheets', 'v4', credentials=creds)
+        sheet = service.spreadsheets()
+        
+        # Prepare the data
+        values = []
+        # Add headers
+        headers = list(data[0].keys())
+        values.append(headers)
+        # Add data rows
+        for row in data:
+            values.append([row.get(header, '') for header in headers])
+        
+        # Prepare the request body
+        body = {
+            'values': values
+        }
+        
+        # Try to update existing sheet
+        try:
+            result = sheet.values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f'{sheet_name}!A1',
+                valueInputOption='RAW',
+                body=body
+            ).execute()
+        except:
+            # If sheet doesn't exist, create it
+            requests = [{
+                'addSheet': {
+                    'properties': {
+                        'title': sheet_name
+                    }
+                }
+            }]
+            sheet.batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={'requests': requests}
+            ).execute()
+            
+            # Now update the new sheet
+            result = sheet.values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f'{sheet_name}!A1',
+                valueInputOption='RAW',
+                body=body
+            ).execute()
+        
+        return result
+    except Exception as e:
+        print(f"Error updating Google Sheet: {str(e)}")
+        return None
 
 # Move these to the top, after imports but before other code
 class ProcessManager:
@@ -34,12 +220,21 @@ class ProcessManager:
         self.drivers = set()
         self.pools = set()
         self.semaphores = []
+        self.chrome_pids = set()  # Track Chrome process IDs
+        self.is_packaged = getattr(sys, 'frozen', False)
+        self.cleanup_attempted = False
     
     def register_process(self, process):
         self.processes.add(process)
     
     def register_driver(self, driver):
         self.drivers.add(driver)
+        # Try to get Chrome process PID for tracking
+        try:
+            if hasattr(driver, 'service') and hasattr(driver.service, 'process'):
+                self.chrome_pids.add(driver.service.process.pid)
+        except:
+            pass
     
     def register_pool(self, pool):
         self.pools.add(pool)
@@ -48,36 +243,119 @@ class ProcessManager:
         self.semaphores.append(sem)
     
     def cleanup(self):
-        # Clean up multiprocessing pools
-        for pool in self.pools:
+        if self.cleanup_attempted:
+            return
+        self.cleanup_attempted = True
+        
+        print("Starting ProcessManager cleanup...")
+        
+        # For packaged apps, be more aggressive
+        if self.is_packaged:
+            self._aggressive_cleanup()
+        else:
+            self._standard_cleanup()
+        
+        print("ProcessManager cleanup completed")
+    
+    def _standard_cleanup(self):
+        """Standard cleanup for development mode"""
+        # Clean up multiprocessing pools first
+        for pool in list(self.pools):
             try:
-                pool.terminate()  # Terminate first
-                pool.join()      # Then join
-                pool.close()     # Finally close
+                print(f"Cleaning up pool: {pool}")
+                pool.terminate()
+                pool.join(timeout=3)
+                pool.close()
+            except Exception as e:
+                print(f"Error cleaning pool: {str(e)}")
+        
+        # Clean up webdrivers
+        for driver in list(self.drivers):
+            try:
+                print(f"Cleaning up driver: {driver}")
+                driver.quit()
+            except Exception as e:
+                print(f"Error cleaning driver: {str(e)}")
+        
+        # Clean up processes
+        for process in list(self.processes):
+            try:
+                print(f"Cleaning up process: {process}")
+                process.terminate()
+                process.join(timeout=2)
+                if process.is_alive():
+                    process.kill()
+            except Exception as e:
+                print(f"Error cleaning process: {str(e)}")
+        
+        self._cleanup_common()
+    
+    def _aggressive_cleanup(self):
+        """Aggressive cleanup for packaged applications"""
+        print("Using aggressive cleanup for packaged app...")
+        
+        # First, try to close pools gracefully but with shorter timeouts
+        for pool in list(self.pools):
+            try:
+                pool.terminate()
+                pool.join(timeout=1)  # Shorter timeout
+                pool.close()
             except:
                 pass
         
-        # Clean up webdrivers
-        for driver in self.drivers:
+        # Force quit all drivers immediately
+        for driver in list(self.drivers):
             try:
                 driver.quit()
             except:
                 pass
         
-        # Clean up processes
-        for process in self.processes:
+        # Kill all tracked Chrome processes
+        for pid in list(self.chrome_pids):
             try:
-                process.terminate()
-                process.join(timeout=1)
-                if process.is_alive():
-                    process.kill()
+                if psutil.pid_exists(pid):
+                    proc = psutil.Process(pid)
+                    proc.kill()  # Use kill instead of terminate for packaged apps
             except:
                 pass
+        
+        # Kill all processes immediately
+        for process in list(self.processes):
+            try:
+                if process.is_alive():
+                    process.kill()  # Use kill instead of terminate
+            except:
+                pass
+        
+        # System-level cleanup for macOS
+        if platform.system() == "Darwin":
+            try:
+                # Kill Chrome processes
+                subprocess.run(['pkill', '-9', '-f', 'chrome'], check=False)
+                subprocess.run(['pkill', '-9', '-f', 'chromedriver'], check=False)
                 
+                # Kill any Python processes that might be related to our app
+                current_pid = os.getpid()
+                for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                    try:
+                        if proc.pid == current_pid:
+                            continue
+                        cmdline = ' '.join(proc.cmdline()).lower() if proc.cmdline() else ''
+                        if any(keyword in cmdline for keyword in ['placement', 'genius', 'spotify']):
+                            proc.kill()
+                    except:
+                        continue
+            except Exception as e:
+                print(f"Error in system cleanup: {str(e)}")
+        
+        self._cleanup_common()
+    
+    def _cleanup_common(self):
+        """Common cleanup tasks"""
         # Clean up semaphores
         for sem in self.semaphores:
             try:
-                sem.unlink()  # Remove the semaphore file
+                sem.unlink()
             except:
                 pass
         
@@ -86,9 +364,15 @@ class ProcessManager:
         self.drivers.clear()
         self.pools.clear()
         self.semaphores.clear()
+        self.chrome_pids.clear()
+        
+        # Force garbage collection
+        gc.collect()
 
-# Create global process manager
-process_manager = ProcessManager()
+# Create global process manager - but only if we're the main process
+process_manager = None
+if _IS_MAIN_PROCESS:
+    process_manager = ProcessManager()
 
 # Then the rest of your code...
 last_api_call_time = 0  # Global variable to track last API call time
@@ -106,7 +390,7 @@ def log_message(root,log_text,message, error=False):
         log_text.see(tk.END)
         root.update()
     except:
-        pass  # In ca
+        pass  # In case of any exception, do nothing
 
 def get_list_of_song_artist_name_track_id_from_spotify_playlist(playlist_url, access_token, mode="all", limit=None):
     """
@@ -190,15 +474,77 @@ def get_list_of_genius_song_urls_from_genius_producer(producer_url, mode="eye_ic
     """
     driver = None
     try:
-        # Initialize Chrome WebDriver
+        # Initialize Chrome WebDriver with better options for packaged apps
         options = webdriver.ChromeOptions()
         options.add_argument('--log-level=3')
-        options.add_argument('--headless')  # Add headless mode
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        process_manager.register_driver(driver)  # Register the driver
-        driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-            "userAgent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        })
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--disable-extensions')
+        options.add_argument('--disable-plugins')
+        options.add_argument('--disable-images')
+        options.add_argument('--disable-javascript')
+        
+        # For packaged apps, be more restrictive
+        if getattr(sys, 'frozen', False):
+            options.add_argument('--single-process')
+            options.add_argument('--no-zygote')
+            options.add_argument('--disable-background-timer-throttling')
+            options.add_argument('--disable-backgrounding-occluded-windows')
+            options.add_argument('--disable-renderer-backgrounding')
+            options.add_argument('--disable-features=TranslateUI')
+            options.add_argument('--disable-ipc-flooding-protection')
+            # Set a specific user data directory to avoid conflicts
+            import tempfile
+            temp_dir = tempfile.mkdtemp()
+            options.add_argument(f'--user-data-dir={temp_dir}')
+        
+        # Try to create driver with timeout
+        driver_created = False
+        max_attempts = 3
+        
+        for attempt in range(max_attempts):
+            try:
+                if getattr(sys, 'frozen', False):
+                    # For packaged apps, use regular Chrome driver with explicit service
+                    service = Service(ChromeDriverManager().install())
+                    service.start()  # Start service explicitly
+                    driver = webdriver.Chrome(service=service, options=options)
+                else:
+                    # For development, try undetected chrome first
+                    try:
+                        driver = uc.Chrome(options=options, version_main=None)
+                    except:
+                        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                
+                driver_created = True
+                break
+                
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_attempts - 1:
+                    raise e
+                time.sleep(2)
+        
+        if not driver_created:
+            raise Exception("Failed to create Chrome driver after multiple attempts")
+            
+        if process_manager:
+            process_manager.register_driver(driver)
+        
+        # Set shorter timeouts for packaged apps
+        if getattr(sys, 'frozen', False):
+            driver.set_page_load_timeout(30)  # 30 seconds max
+            driver.implicitly_wait(10)  # 10 seconds max
+        
+        # Set user agent
+        try:
+            driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+                "userAgent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            })
+        except:
+            pass  # CDP commands might not work in all configurations
         
         wait = WebDriverWait(driver, 20)
         
@@ -214,8 +560,10 @@ def get_list_of_genius_song_urls_from_genius_producer(producer_url, mode="eye_ic
             
             last_height = driver.execute_script("return document.documentElement.scrollHeight")
             previous_items_count = 0
+            max_scrolls = 50 if not getattr(sys, 'frozen', False) else 20  # Limit scrolls for packaged apps
+            scroll_count = 0
             
-            while True:
+            while scroll_count < max_scrolls:
                 # Get current page content and process items
                 soup = BeautifulSoup(driver.page_source, 'html.parser')
                 song_items = soup.find_all('li', class_=lambda x: x and 'ListItem-' in x)
@@ -254,14 +602,14 @@ def get_list_of_genius_song_urls_from_genius_producer(producer_url, mode="eye_ic
                 
                 # Scroll and check for end of page
                 driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
-                time.sleep(3)
+                time.sleep(2 if getattr(sys, 'frozen', False) else 3)  # Shorter sleep for packaged apps
                 
                 new_height = driver.execute_script("return document.documentElement.scrollHeight")
                 
                 # If height hasn't changed and no new items loaded, we've reached the end
                 if new_height == last_height:
                     # Try waiting one more time for content
-                    time.sleep(3)
+                    time.sleep(2)
                     soup = BeautifulSoup(driver.page_source, 'html.parser')
                     final_count = len(soup.find_all('li', class_=lambda x: x and 'ListItem-' in x))
                     
@@ -277,6 +625,7 @@ def get_list_of_genius_song_urls_from_genius_producer(producer_url, mode="eye_ic
                             return song_urls
                 
                 last_height = new_height
+                scroll_count += 1
         
         except Exception as e:
             print(f"Error scraping producer page: {str(e)}")
@@ -285,15 +634,44 @@ def get_list_of_genius_song_urls_from_genius_producer(producer_url, mode="eye_ic
     finally:
         if driver:
             try:
+                # More aggressive cleanup for packaged apps
                 driver.quit()
-            except:
-                pass
-    
+                
+                # For packaged apps, ensure Chrome processes are killed
+                if getattr(sys, 'frozen', False) and platform.system() == "Darwin":
+                    time.sleep(1)
+                    subprocess.run(['pkill', '-9', '-f', 'chrome'], check=False)
+                    subprocess.run(['pkill', '-9', '-f', 'chromedriver'], check=False)
+                    
+            except Exception as e:
+                print(f"Error closing driver: {str(e)}")
+                # Force kill if normal quit fails
+                if platform.system() == "Darwin":
+                    subprocess.run(['pkill', '-9', '-f', 'chrome'], check=False)
 
 def get_everything_from_spotify_producer_page(producer_url, batch_size=9, test=True, mode="all", limit=None, genius_token=None, spotify_access_token=None):
     """
     Version with rate limiting and proper resource cleanup
     """
+    # Prevent multiprocessing during import
+    if not _ALLOW_MULTIPROCESSING:
+        print("Multiprocessing not allowed during import - using sequential processing")
+        # Fallback to sequential processing
+        results = []
+        song_dict = get_list_of_song_artist_name_track_id_from_spotify_playlist(producer_url, mode=mode, limit=5 if test else limit, access_token=spotify_access_token)
+        for i, song_data in enumerate(song_dict):
+            try:
+                result = get_genius_song_credits_from_api(
+                    None, None, song_data.get("song_name"), 
+                    song_data.get("artist_name"), song_data.get("track_id"), genius_token
+                )
+                if result.get("song_name") is not None:
+                    results.append(result)
+            except Exception as e:
+                print(f"Error processing song: {str(e)}")
+                continue
+        return results
+    
     update_progress(0, "Getting the producer song list...")
     
     if test:
@@ -311,10 +689,82 @@ def get_everything_from_spotify_producer_page(producer_url, batch_size=9, test=T
     num_processes = min(cpu_count(), batch_size)
     results = []
     
-    try:
-        ctx = multiprocessing.get_context('spawn')
-        with ctx.Pool(processes=num_processes) as pool:
-            process_manager.register_pool(pool)
+    # Use different multiprocessing approach for packaged vs development
+    if getattr(sys, 'frozen', False):
+        # For packaged application, use reduced parallelism with better process management
+        num_processes = min(2, num_processes)  # Limit to 2 processes max for stability
+        pool = None
+        try:
+            # Use spawn context with explicit process management
+            ctx = multiprocessing.get_context('spawn')
+            pool = ctx.Pool(processes=num_processes, maxtasksperchild=5)  # Limit tasks per child
+            if process_manager:
+                process_manager.register_pool(pool)
+            
+            # Process in smaller batches for better control
+            small_batch_size = min(3, batch_size)
+            
+            for i in range(0, len(song_dict), small_batch_size):
+                batch_idx = i // small_batch_size + 1
+                try:
+                    batch_results = pool.starmap(get_genius_song_credits_from_api, 
+                        [(None, None, song_dict[j].get("song_name"), 
+                          song_dict[j].get("artist_name"), song_dict[j].get("track_id"), genius_token) 
+                         for j in range(i, min(i + small_batch_size, len(song_dict)))])
+                    results.extend([r for r in batch_results if r.get("song_name") is not None])
+                except Exception as e:
+                    print(f"Error in batch processing: {str(e)}")
+                    continue
+                    
+                current_progress = 20 + (batch_idx * 30.0 / len(song_dict) * small_batch_size)
+                update_progress(current_progress, f"Obtained detailed information for {min(i + small_batch_size, len(song_dict))} songs")
+                
+                # Longer sleep between batches for packaged apps
+                if i + small_batch_size < len(song_dict):
+                    time.sleep(1.0)
+                    
+        except Exception as e:
+            print(f"Error in packaged multiprocessing: {str(e)}")
+            # Fallback to sequential processing if multiprocessing fails
+            print("Falling back to sequential processing...")
+            for i, song_data in enumerate(song_dict):
+                try:
+                    result = get_genius_song_credits_from_api(
+                        None, None, song_data.get("song_name"), 
+                        song_data.get("artist_name"), song_data.get("track_id"), genius_token
+                    )
+                    if result.get("song_name") is not None:
+                        results.append(result)
+                    
+                    current_progress = 20 + ((i + 1) * 30.0 / len(song_dict))
+                    update_progress(current_progress, f"Obtained detailed information for {i + 1} songs")
+                    
+                except Exception as e:
+                    print(f"Error processing song: {str(e)}")
+                    continue
+        finally:
+            if pool:
+                try:
+                    pool.close()
+                    pool.join(timeout=10)  # Longer timeout for packaged apps
+                    pool.terminate()
+                except Exception as e:
+                    print(f"Error closing pool: {str(e)}")
+            gc.collect()
+    else:
+        # For development, use multiprocessing with better cleanup
+        pool = None
+        try:
+            # Use fork context on Unix systems when available, spawn for Windows
+            if platform.system() == "Darwin" and hasattr(multiprocessing, 'get_context'):
+                ctx = multiprocessing.get_context('fork')
+            else:
+                ctx = multiprocessing.get_context('spawn')
+                
+            pool = ctx.Pool(processes=num_processes)
+            if process_manager:
+                process_manager.register_pool(pool)
+            
             for i in range(0, len(song_dict), batch_size):
                 batch_idx = i // batch_size + 1
                 try:
@@ -330,8 +780,15 @@ def get_everything_from_spotify_producer_page(producer_url, batch_size=9, test=T
                 update_progress(current_progress, f"Obtained detailed information for {min(i + batch_size, len(song_dict))} songs")
                 if i + batch_size < len(song_dict):
                     time.sleep(0.5)
-    finally:
-        gc.collect()
+        finally:
+            if pool:
+                try:
+                    pool.close()
+                    pool.join(timeout=5)  # Add timeout
+                    pool.terminate()
+                except:
+                    pass
+            gc.collect()
     
     return results
 
@@ -473,9 +930,9 @@ def calculate_stream_stats(history_json):
     return {"stream_count": stream_count, "change_in_streams": change_in_streams}
 
 
-def export_to_csv(data, filepath):
+def export_to_csv(data, filepath, export_to_sheets=False, spreadsheet_id=None, sheet_name=None):
     """
-    Write the collected data to a CSV file with formatted numbers.
+    Write the collected data to a CSV file and optionally to Google Sheets.
     """
     if not data:
         return
@@ -509,12 +966,18 @@ def export_to_csv(data, filepath):
             
         formatted_data.append(formatted_item)
     
+    # Create simplified data
+    simplified_data = []
+    for item in formatted_data:
+        simplified_item = {field: item.get(field, '') for field in simp_fieldnames}
+        simplified_data.append(simplified_item)
+    
     # Write simplified CSV
     try:
         with open(filepath.replace(".csv", " - Placement Tracker - Simplified.csv"), "w+", newline="", encoding="utf-8") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=simp_fieldnames, extrasaction='ignore')
             writer.writeheader()
-            writer.writerows(formatted_data)
+            writer.writerows(simplified_data)
     except Exception as e:
         print(f"Error writing simplified CSV: {str(e)}")
         
@@ -526,7 +989,35 @@ def export_to_csv(data, filepath):
             writer.writerows(formatted_data)
     except Exception as e:
         print(f"Error writing raw CSV: {str(e)}")
+    
+    # Export to Google Sheets if requested
+    if export_to_sheets and spreadsheet_id and sheet_name:
+        try:
+            # Export simplified data
+            simplified_sheet_name = f"{sheet_name} - Simplified"
+            result = create_or_update_sheet(spreadsheet_id, simplified_sheet_name, simplified_data)
+            if result:
+                print(f"Successfully exported simplified data to Google Sheets: {simplified_sheet_name}")
+            else:
+                print("Failed to export simplified data to Google Sheets")
+            
+            # Export raw data
+            raw_sheet_name = f"{sheet_name} - Raw"
+            result = create_or_update_sheet(spreadsheet_id, raw_sheet_name, formatted_data)
+            if result:
+                print(f"Successfully exported raw data to Google Sheets: {raw_sheet_name}")
+            else:
+                print("Failed to export raw data to Google Sheets")
+                
+        except Exception as e:
+            print(f"Error exporting to Google Sheets: {str(e)}")
+
 def run_gui():
+    print("run_gui() called")
+    # Enable multiprocessing now that we're in the main application
+    global _ALLOW_MULTIPROCESSING
+    _ALLOW_MULTIPROCESSING = True
+    
     # Load credentials at startup
     credentials = load_credentials()
     if not credentials:
@@ -540,8 +1031,11 @@ def run_gui():
     def on_closing():
         """Handle cleanup when window is closed"""
         try:
+            print("Application closing - starting cleanup...")
+            
             # Clean up all processes
-            process_manager.cleanup()
+            if process_manager:
+                process_manager.cleanup()
             
             # Destroy all child windows
             for child in root.winfo_children():
@@ -554,8 +1048,60 @@ def run_gui():
             # Force garbage collection
             gc.collect()
             
+            # For packaged applications, be more aggressive
+            if getattr(sys, 'frozen', False):
+                print("Packaged app detected - using aggressive cleanup...")
+                
+                if platform.system() == "Darwin":  # macOS
+                    # Wait a moment for normal cleanup to complete
+                    time.sleep(1)
+                    
+                    # Kill any remaining processes related to our app
+                    try:
+                        current_pid = os.getpid()
+                        parent_pid = os.getppid()
+                        
+                        # Kill Chrome and chromedriver processes
+                        subprocess.run(['pkill', '-9', '-f', 'chrome'], check=False)
+                        subprocess.run(['pkill', '-9', '-f', 'chromedriver'], check=False)
+                        
+                        # Kill any Python processes that might be related to our app
+                        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'ppid']):
+                            try:
+                                # Skip our own process and parent
+                                if proc.pid in [current_pid, parent_pid]:
+                                    continue
+                                    
+                                cmdline = ' '.join(proc.cmdline()).lower() if proc.cmdline() else ''
+                                name = proc.name().lower()
+                                
+                                # Kill processes that might be related to our app
+                                if any(keyword in cmdline for keyword in ['placement', 'genius', 'spotify', 'multiprocessing']):
+                                    print(f"Killing related process: {proc.name()} (PID: {proc.pid})")
+                                    proc.kill()
+                                elif 'python' in name and proc.ppid() == current_pid:
+                                    # Kill child Python processes
+                                    print(f"Killing child Python process: {proc.name()} (PID: {proc.pid})")
+                                    proc.kill()
+                                    
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                continue
+                                
+                    except Exception as e:
+                        print(f"Error in aggressive cleanup: {str(e)}")
+                
+                # Force exit for packaged apps
+                print("Forcing application exit...")
+                os._exit(0)
+            else:
+                # For development, use normal exit
+                print("Development mode - using normal exit...")
+                sys.exit(0)
+            
         except Exception as e:
             print(f"Error during cleanup: {str(e)}")
+            # Force exit even if there's an error
+            os._exit(1)
             
     root.protocol("WM_DELETE_WINDOW", on_closing)
     
@@ -634,7 +1180,7 @@ def run_gui():
 
     # --- Output Options Frame ---
     frame_output = tk.Frame(main_frame)
-    frame_output.pack(fill='x', anchor='w', pady=5)
+    frame_output.pack(fill='x', anchor='w')
     
     default_dir = os.path.expanduser("~/Documents")
     
@@ -651,6 +1197,47 @@ def run_gui():
     tk.Label(filename_frame, text="Base Filename (suggest using producer name):").pack(side='left')
     filename_entry = tk.Entry(filename_frame, width=40)
     filename_entry.pack(side='left', padx=5)
+
+    # Add Google Sheets options
+    sheets_frame = tk.Frame(frame_output)
+    sheets_frame.pack(fill='x', anchor='w', pady=5)
+    
+    # Google Sheets section header
+    sheets_header = tk.Frame(sheets_frame)
+    sheets_header.pack(fill='x', anchor='w', pady=(0, 5))
+    tk.Label(sheets_header, text="Google Sheets Export", font=('TkDefaultFont', 10, 'bold')).pack(side='left')
+    
+    # Help button for Google Sheets
+    def show_sheets_help():
+        help_text = """To export to Google Sheets:
+1. Create a Google Sheet and share it with your team
+2. Copy the Spreadsheet ID from the URL:
+   - It's the long string between /d/ and /edit
+   - Example: docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/edit
+   - The ID would be: 1AbCdEfGhIjKlMnOpQrStUvWxYz
+3. Enter the Sheet name (defaults to today's date)
+4. Check 'Export to Google Sheets'"""
+        messagebox.showinfo("Google Sheets Help", help_text)
+    
+    tk.Button(sheets_header, text="?", command=show_sheets_help, width=2).pack(side='left', padx=5)
+    
+    # Google Sheets export checkbox
+    export_to_sheets_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(sheets_frame, text="Export to Google Sheets", variable=export_to_sheets_var).pack(anchor='w', pady=(0, 5))
+    
+    # Spreadsheet ID entry with better label
+    spreadsheet_frame = tk.Frame(sheets_frame)
+    spreadsheet_frame.pack(fill='x', anchor='w', pady=2)
+    tk.Label(spreadsheet_frame, text="Spreadsheet ID (from Google Sheets URL):").pack(side='left')
+    spreadsheet_id_var = tk.StringVar()
+    tk.Entry(spreadsheet_frame, textvariable=spreadsheet_id_var, width=50).pack(side='left', padx=5)
+    
+    # Sheet name entry with better label
+    sheet_name_frame = tk.Frame(sheets_frame)
+    sheet_name_frame.pack(fill='x', anchor='w', pady=2)
+    tk.Label(sheet_name_frame, text="Sheet Name (will create -Simplified and -Raw versions):").pack(side='left')
+    sheet_name_var = tk.StringVar(value=datetime.datetime.now().strftime("%Y-%m-%d"))
+    tk.Entry(sheet_name_frame, textvariable=sheet_name_var, width=20).pack(side='left', padx=5)
 
     # --- Progress Frame ---
     frame_progress = tk.Frame(main_frame)
@@ -817,7 +1404,7 @@ def run_gui():
 
         # Define the CSV file path and export the data
         csv_path = os.path.join(save_dir, f"{file_name}.csv")
-        export_to_csv(results, csv_path)
+        export_to_csv(results, csv_path, export_to_sheets=export_to_sheets_var.get(), spreadsheet_id=spreadsheet_id_var.get(), sheet_name=sheet_name_var.get())
         messagebox.showinfo("Success", f"CSV file generated at: {csv_path} and {csv_path.replace('.csv', '_raw.csv')}")
 
     tk.Button(main_frame, text="Start Processing", command=process_data, width=20).pack(anchor='w', pady=10)
@@ -1035,7 +1622,8 @@ def cleanup_resources():
     """Clean up any remaining resources"""
     try:
         # Clean up processes
-        process_manager.cleanup()
+        if process_manager:
+            process_manager.cleanup()
         
         # Force garbage collection
         gc.collect()
@@ -1048,7 +1636,8 @@ def signal_handler(signum, frame):
     print("\nReceived termination signal. Cleaning up...")
     try:
         # Clean up all processes
-        process_manager.cleanup()
+        if process_manager:
+            process_manager.cleanup()
         
         # Force garbage collection
         gc.collect()
@@ -1252,19 +1841,25 @@ def get_list_of_genius_song_producer_api(producer_url, mode="all", limit=None, a
 
 #%%
 if __name__ == "__main__":
+    print(f"IMPORT: __name__={__name__}, sys.argv={sys.argv}, frozen={getattr(sys, 'frozen', False)}")
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
     signal.signal(signal.SIGTERM, signal_handler)  # Termination request
     
     try:
-        multiprocessing.freeze_support()
+        # Ensure multiprocessing is properly initialized for packaged apps
+        if getattr(sys, 'frozen', False):
+            multiprocessing.freeze_support()
+        
+        # Start the GUI application
         run_gui()
     except Exception as e:
         print(f"Error in main execution: {str(e)}")
     finally:
         try:
             # Clean up all processes
-            process_manager.cleanup()
+            if process_manager:
+                process_manager.cleanup()
             
             # Force garbage collection
             gc.collect()
