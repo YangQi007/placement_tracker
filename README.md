@@ -68,7 +68,7 @@ A Python application that helps track music placements and their performance met
 
 ### macOS
 ```bash
-python build.py
+pyinstaller --clean PlacementTracker.spec
 ```
 
 ### Windows
