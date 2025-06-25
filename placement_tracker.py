@@ -326,6 +326,35 @@ def get_songs_from_spotify_playlist(session, playlist_url, limit, access_token):
         print(f"Failed to get Spotify playlist songs: {e}")
         return []
 
+def get_songs_from_spotify_album(session, album_url, limit, access_token):
+    """Gets a list of songs (name, artist, track_id) from a Spotify album."""
+    try:
+        album_id = album_url.split('/album/')[1].split('?')[0]
+        url = f"https://api.spotify.com/v1/albums/{album_id}/tracks"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        
+        songs = []
+        while url:
+            if limit and len(songs) >= limit:
+                break
+            response = session.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            for track in data.get('items', []):
+                if track and track.get('name') and track.get('artists'):
+                    songs.append({
+                        'song_name': track['name'],
+                        'artist_name': track['artists'][0]['name'],
+                        'track_id': track.get('id')
+                    })
+            
+            url = data.get('next')  # For pagination
+        return songs[:limit] if limit else songs
+    except (requests.RequestException, IndexError, KeyError) as e:
+        print(f"Failed to get Spotify album songs: {e}")
+        return []
+
 def parse_manual_input(manual_list_text):
     """Parses manual 'Song - Artist' input into a list of dicts."""
     songs = []
@@ -659,8 +688,10 @@ class PlacementTrackerApp:
                 song_ids = get_songs_from_genius_producer_api(session, params['producer_url'], params['limit'], genius_token)
                 # Return list of dicts with just the ID to be processed later
                 return [{'song_id': sid} for sid in song_ids]
-            elif 'spotify.com' in params['producer_url']:
+            elif 'spotify.com/playlist/' in params['producer_url']:
                 return get_songs_from_spotify_playlist(session, params['producer_url'], params['limit'], spotify_token)
+            elif 'spotify.com/album/' in params['producer_url']:
+                return get_songs_from_spotify_album(session, params['producer_url'], params['limit'], spotify_token)
         elif params['manual_input']:
             return parse_manual_input(params['manual_input'])
         return []
