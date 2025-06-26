@@ -21,7 +21,7 @@ def build():
         print("Building for macOS...")
         try:
             # Build the app
-            result = subprocess.run(["pyinstaller", "--clean", "Placement_Tracker_Mac.spec"], 
+            result = subprocess.run(["pyinstaller", "--clean", "PlacementTracker.spec"], 
                                   capture_output=True, text=True)
             if result.returncode != 0:
                 print(f"PyInstaller failed: {result.stderr}")
